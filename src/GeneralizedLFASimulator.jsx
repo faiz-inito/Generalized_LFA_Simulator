@@ -391,6 +391,26 @@ const PHYSICAL_META = [
 ];
 const defPhysical = () => Object.fromEntries(PHYSICAL_META.map(m => [m.key, m.def]));
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SLIDER UPPER-LIMIT METADATA
+// ═══════════════════════════════════════════════════════════════════════════
+// Concentration slider upper bounds the user can extend at runtime.
+//
+// Architecture note: in the generalized simulator the conjugate `Po` slider
+// is rendered once per conjugate inside AnCjBuilder, and conjugates can be
+// added/removed dynamically. Rather than tracking per-conjugate limits
+// (which would need create/delete bookkeeping), we use ONE shared cap that
+// applies to every conjugate's Po slider. Line Ro and fixedAg are already
+// rendered as plain unbounded number inputs and don't need this treatment.
+// Analyte [A₀] is a LogSlider spanning 1e-9 to 1e2 nM — already wide enough.
+// ═══════════════════════════════════════════════════════════════════════════
+const SLIDER_LIMITS_META = [
+  { key:"Po", label:"Conjugate [P₀] (all)", unit:"nM", min:0.1, def:100 },
+];
+function defaultSliderLimits() {
+  return Object.fromEntries(SLIDER_LIMITS_META.map(m => [m.key, m.def]));
+}
+
 const PADS = [
   { id:"sample", label:"Sample Pad",    sub:"sample application",  frac:[0.00,0.09], bg:"#0e1f0e", bdr:"#2a6040", acc:"#4ade80" },
   { id:"conj",   label:"Conjugate Pad", sub:"labelled antibodies",  frac:[0.09,0.20], bg:"#130d22", bdr:"#5030a0", acc:"#c084fc" },
@@ -538,6 +558,95 @@ const RemoveBtn = ({ onClick, title="Remove" }) => (
     ✕ Remove
   </button>
 );
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LIMIT ROW  (one row inside the Limits sub-tab)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Lets the user override the upper bound of one slider type. In the
+// generalized simulator that means: the cap for the Po slider on every
+// conjugate (one shared cap, applied across all conjugates).
+//
+// Validation rules (applied at commit, i.e. blur or Enter):
+//   1. Must parse as a finite number (NaN / "" / Infinity rejected)
+//   2. Must be strictly greater than the slider's hard floor `meta.min`
+//   3. Must be a positive value
+//
+// On a successful commit we call onChange(newMax). The parent then updates
+// the limit in state and clamps any conjugate Po that exceeds the new max.
+// ═══════════════════════════════════════════════════════════════════════════
+function LimitRow({ meta, currentMax, currentValuesPreview, onChange }) {
+  const [raw, setRaw]     = useState(String(currentMax));
+  const [err, setErr]     = useState(null);
+  const [dirty, setDirty] = useState(false);
+
+  useEffect(() => {
+    setRaw(String(currentMax));
+    setErr(null);
+    setDirty(false);
+  }, [currentMax]);
+
+  const commit = () => {
+    const v = parseFloat(raw);
+    if (!isFinite(v))   { setErr("Not a valid number"); return; }
+    if (v <= 0)         { setErr("Must be positive");   return; }
+    if (v <= meta.min)  { setErr(`Must be > ${meta.min}`); return; }
+    setErr(null);
+    setDirty(false);
+    onChange(v);
+  };
+
+  // Will-be-clamped warning: any current value above the proposed new max
+  const proposedMax = parseFloat(raw);
+  const willClamp   = !err && dirty && isFinite(proposedMax) &&
+                      currentValuesPreview.some(v => v > proposedMax);
+
+  return (
+    <div style={{marginBottom:10}}>
+      <div style={{display:"flex",alignItems:"center",gap:6}}>
+        <span style={{color:T.muted2,fontSize:10,flex:1,minWidth:0}}>{meta.label}</span>
+        <div style={{display:"flex",alignItems:"center",gap:4}}>
+          <span style={{color:T.muted,fontSize:9}}>max</span>
+          <input
+            value={raw}
+            onChange={e => { setRaw(e.target.value); setDirty(true); setErr(null); }}
+            onBlur={commit}
+            onKeyDown={e => e.key === "Enter" && commit()}
+            style={{
+              background:T.surface,
+              border:`1px solid ${err?T.err:dirty?T.accent:T.border}`,
+              borderRadius:5,
+              color:err?T.err:T.text,
+              padding:"3px 6px",
+              fontSize:10,
+              fontFamily:"'DM Mono',monospace",
+              width:80, outline:"none", transition:"border 0.15s",
+            }}
+          />
+          <span style={{color:T.muted,fontSize:9,minWidth:24}}>{meta.unit}</span>
+        </div>
+        {!err && dirty && <span style={{color:T.ok,fontSize:9}}>↵</span>}
+      </div>
+      <div style={{color:T.muted,fontSize:8,marginTop:2,paddingLeft:2,
+        display:"flex",justifyContent:"space-between"}}>
+        <span>min ≥ {meta.min} · current values: {currentValuesPreview.length
+          ? currentValuesPreview.map(v=>Number(v).toFixed(v<10?2:1)).join(", ")
+          : "—"}</span>
+        <span>default: {meta.def}</span>
+      </div>
+      {err && (
+        <div style={{color:T.err,fontSize:9,marginTop:2,fontStyle:"italic"}}>
+          ⚠ {err}
+        </div>
+      )}
+      {willClamp && (
+        <div style={{color:T.warn,fontSize:9,marginTop:2,fontStyle:"italic"}}>
+          ⚠ values above {proposedMax} will be clamped down
+        </div>
+      )}
+    </div>
+  );
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // STRIP CANVAS
@@ -1099,7 +1208,7 @@ function LineBuilder({ lines, setLines, analytes, conjugates, physParams }) {
 // ═══════════════════════════════════════════════════════════════════════════
 // ANALYTES & CONJUGATES BUILDER
 // ═══════════════════════════════════════════════════════════════════════════
-function AnCjBuilder({ analytes, setAnalytes, conjugates, setConjugates }) {
+function AnCjBuilder({ analytes, setAnalytes, conjugates, setConjugates, poMax = 100 }) {
   const updA=(id,f,v)=>setAnalytes(p=>p.map(a=>a.id===id?{...a,[f]:v}:a));
   const updC=(id,f,v)=>setConjugates(p=>p.map(c=>c.id===id?{...c,[f]:v}:c));
   const addA=()=>setAnalytes(p=>[...p,{id:uid(),name:`Analyte ${String.fromCharCode(65+p.length)}`,Ao:0.01}]);
@@ -1144,7 +1253,7 @@ function AnCjBuilder({ analytes, setAnalytes, conjugates, setConjugates }) {
             <RemoveBtn onClick={()=>setConjugates(p=>p.filter(x=>x.id!==c.id))} title="Remove conjugate"/>
           </div>
           <Slider label="[P₀] conj. conc." value={parseFloat(c.Po)||6}
-            min={0.1} max={100} step={0.5} unit="nM" color={T.P} onChange={v=>updC(c.id,"Po",v)}/>
+            min={0.1} max={poMax} step={0.5} unit="nM" color={T.P} onChange={v=>updC(c.id,"Po",v)}/>
           <label style={{fontSize:9,color:T.muted2,display:"flex",gap:6,alignItems:"center",marginBottom:6}}>
             Binds analyte:
             <select value={c.analyteId} onChange={e=>updC(c.id,"analyteId",e.target.value)}
@@ -1523,6 +1632,28 @@ export default function LFASimulator() {
     { id:"l4", name:"C",  type:"control",     pos:75, analyteId:"a1", conjId:"c1", Ro:10,  fixedAg:0,  Ka2:7.35e-4, Kd2:5.7e-5 },
   ]);
   const [physParams,  setPhysParams]  = useState(defPhysical());
+
+  // ── Slider upper-limit overrides ──────────────────────────────────────────
+  // Single shared cap for all conjugate Po sliders (see SLIDER_LIMITS_META
+  // for the architecture rationale). Session-only — no persistence.
+  const [sliderLimits, setSliderLimits] = useState(defaultSliderLimits());
+
+  // Updater that:
+  //   1. writes the new max into sliderLimits, and
+  //   2. clamps every conjugate's Po down to the new max if it exceeds it.
+  // Without step 2 the slider thumb would render off-screen.
+  const updateSliderLimit = useCallback((key, newMax) => {
+    setSliderLimits(prev => ({ ...prev, [key]: newMax }));
+    if (key === "Po") {
+      setConjugates(prev =>
+        prev.map(c => {
+          const cur = parseFloat(c.Po);
+          return isFinite(cur) && cur > newMax ? { ...c, Po: newMax } : c;
+        })
+      );
+    }
+  }, []);
+
   const [simData,     setSimData]     = useState(null);
   const [running,     setRunning]     = useState(false);
   const [frameIdx,    setFrameIdx]    = useState(0);
@@ -1614,7 +1745,7 @@ export default function LFASimulator() {
 
           {/* Sub-tabs: Kinetics removed */}
           <div style={{display:"flex",gap:3,marginBottom:14,background:T.surface,borderRadius:7,padding:3}}>
-            {[["lines","Lines"],["ancj","A / Conj"],["physical","Physical"]].map(([id,lbl])=>(
+            {[["lines","Lines"],["ancj","A / Conj"],["physical","Physical"],["limits","Limits"]].map(([id,lbl])=>(
               <button key={id} onClick={()=>setLeftTab(id)}
                 style={{flex:1,background:leftTab===id?"#1a2a45":T.surface,
                   border:`1px solid ${leftTab===id?T.borderHi:"transparent"}`,
@@ -1628,7 +1759,7 @@ export default function LFASimulator() {
           {leftTab==="lines"&&<LineBuilder lines={lines} setLines={setLines}
             analytes={analytes} conjugates={conjugates} physParams={physParams}/>}
           {leftTab==="ancj"&&<AnCjBuilder analytes={analytes} setAnalytes={setAnalytes}
-            conjugates={conjugates} setConjugates={setConjugates}/>}
+            conjugates={conjugates} setConjugates={setConjugates} poMax={sliderLimits.Po}/>}
           {leftTab==="physical"&&<>
             <div style={{fontSize:9,color:T.muted,letterSpacing:3,textTransform:"uppercase",marginBottom:4}}>
               Physical Parameters
@@ -1645,6 +1776,50 @@ export default function LFASimulator() {
                 color:T.muted2,padding:"5px 0",borderRadius:6,cursor:"pointer",
                 fontFamily:"inherit",fontSize:10,width:"100%"}}>
               Reset to Defaults
+            </button>
+          </>}
+
+          {/* Limits tab — extend slider upper bounds */}
+          {leftTab==="limits"&&<>
+            <div style={{fontSize:9,color:T.muted,letterSpacing:3,textTransform:"uppercase",marginBottom:4}}>
+              Slider Upper Limits
+            </div>
+            <div style={{fontSize:9,color:T.muted2,marginBottom:12,lineHeight:1.5}}>
+              Extend the upper bound of concentration sliders. The Po cap below
+              applies to <span style={{color:T.P}}>every conjugate's</span> P₀
+              slider. Enter a positive number above the slider's floor, then
+              press Enter or click away. Values above the new max are clamped down.
+              Line Ro and fixedAg are already free-form number inputs (no max).
+            </div>
+            {SLIDER_LIMITS_META.map(m=>{
+              // Build preview list of current values that this cap applies to.
+              // For "Po" key that's every conjugate's Po.
+              const preview = m.key === "Po"
+                ? conjugates.map(c => parseFloat(c.Po) || 0)
+                : [];
+              return (
+                <LimitRow key={m.key} meta={m}
+                  currentMax={sliderLimits[m.key]}
+                  currentValuesPreview={preview}
+                  onChange={v=>updateSliderLimit(m.key,v)}/>
+              );
+            })}
+            <button onClick={()=>{
+                // Reset all limits to defaults; clamp every conjugate's Po
+                // down to the restored default if it sits above it.
+                const def = defaultSliderLimits();
+                setSliderLimits(def);
+                setConjugates(prev =>
+                  prev.map(c => {
+                    const cur = parseFloat(c.Po);
+                    return isFinite(cur) && cur > def.Po ? { ...c, Po: def.Po } : c;
+                  })
+                );
+              }}
+              style={{marginTop:8,background:T.surface,border:`1px solid ${T.border}`,
+                color:T.muted2,padding:"5px 0",borderRadius:6,cursor:"pointer",
+                fontFamily:"inherit",fontSize:10,width:"100%"}}>
+              Reset Limits to Defaults
             </button>
           </>}
 

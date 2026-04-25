@@ -283,6 +283,22 @@ const PHYSICAL_META = [
 function defaultKinetic() { return Object.fromEntries(KINETIC_META.map(m => [m.key, m.def])); }
 function defaultPhysical() { return Object.fromEntries(PHYSICAL_META.map(m => [m.key, m.def])); }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLIDER UPPER-LIMIT METADATA
+// ═══════════════════════════════════════════════════════════════════════════════
+// Lets the user override slider upper bounds at runtime via the "Limits"
+// sub-tab. Validation is permissive (any positive number above `min`); no
+// hard ceiling enforced — see LimitRow for the full validation rules.
+// ═══════════════════════════════════════════════════════════════════════════════
+const SLIDER_LIMITS_META = [
+  { key:"Po",    label:"Detector [P₀]",          unit:"nM", min:0.1, def:100 },
+  { key:"Ag_tl", label:"Immob. antigen [Ag_TL]", unit:"nM", min:0.1, def:100 },
+  { key:"Ro_cl", label:"Ctrl receptor [Rc]",     unit:"nM", min:0.1, def:100 },
+];
+function defaultSliderLimits() {
+  return Object.fromEntries(SLIDER_LIMITS_META.map(m => [m.key, m.def]));
+}
+
 function validateParam(meta, rawStr) {
   const v = parseFloat(rawStr);
   if (isNaN(v)) return { ok: false, msg: "Not a number" };
@@ -926,6 +942,90 @@ function ParamRow({ meta, value, onChange }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// LIMIT ROW  (one row inside the Limits sub-tab)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Lets the user override the upper bound of a single slider.
+//
+// Validation rules (applied at commit, i.e. blur or Enter):
+//   1. Must parse as a finite number (NaN / "" / Infinity rejected)
+//   2. Must be strictly greater than the slider's hard floor `meta.min`
+//   3. Must be a positive value
+//
+// On a successful commit we call onChange(newMax). The parent then:
+//   • updates the limit in state, and
+//   • clamps the current slider value down if it exceeds the new max
+//     (so the slider thumb never falls off the right edge).
+// ═══════════════════════════════════════════════════════════════════════════════
+function LimitRow({ meta, currentValue, currentMax, onChange }) {
+  const [raw, setRaw]     = useState(String(currentMax));
+  const [err, setErr]     = useState(null);
+  const [dirty, setDirty] = useState(false);
+
+  useEffect(() => {
+    setRaw(String(currentMax));
+    setErr(null);
+    setDirty(false);
+  }, [currentMax]);
+
+  const commit = () => {
+    const v = parseFloat(raw);
+    if (!isFinite(v))   { setErr("Not a valid number"); return; }
+    if (v <= 0)         { setErr("Must be positive");   return; }
+    if (v <= meta.min)  { setErr(`Must be > ${meta.min}`); return; }
+    setErr(null);
+    setDirty(false);
+    onChange(v);
+  };
+
+  const clampWarn = !err && dirty && parseFloat(raw) < currentValue;
+
+  return (
+    <div style={{marginBottom:10}}>
+      <div style={{display:"flex",alignItems:"center",gap:6}}>
+        <span style={{color:T.muted2,fontSize:10,flex:1,minWidth:0}}>{meta.label}</span>
+        <div style={{display:"flex",alignItems:"center",gap:4}}>
+          <span style={{color:T.muted,fontSize:9}}>max</span>
+          <input
+            value={raw}
+            onChange={e => { setRaw(e.target.value); setDirty(true); setErr(null); }}
+            onBlur={commit}
+            onKeyDown={e => e.key === "Enter" && commit()}
+            style={{
+              background:T.surface,
+              border:`1px solid ${err?T.err:dirty?T.accent:T.border}`,
+              borderRadius:5,
+              color:err?T.err:T.text,
+              padding:"3px 6px",
+              fontSize:10,
+              fontFamily:"'DM Mono',monospace",
+              width:80, outline:"none", transition:"border 0.15s",
+            }}
+          />
+          <span style={{color:T.muted,fontSize:9,minWidth:24}}>{meta.unit}</span>
+        </div>
+        {!err && dirty && <span style={{color:T.ok,fontSize:9}}>↵</span>}
+      </div>
+      <div style={{color:T.muted,fontSize:8,marginTop:2,paddingLeft:2,
+        display:"flex",justifyContent:"space-between"}}>
+        <span>min ≥ {meta.min} · current value: {Number(currentValue).toFixed(currentValue<10?2:1)}</span>
+        <span>default: {meta.def}</span>
+      </div>
+      {err && (
+        <div style={{color:T.err,fontSize:9,marginTop:2,fontStyle:"italic"}}>
+          ⚠ {err}
+        </div>
+      )}
+      {clampWarn && (
+        <div style={{color:T.warn,fontSize:9,marginTop:2,fontStyle:"italic"}}>
+          ⚠ current value ({currentValue}) will be clamped to {parseFloat(raw)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // OD ASSESSMENT  (inverted verdict logic)
 // ═══════════════════════════════════════════════════════════════════════════════
 function ODBars({ PAg_val, PCval, CPval, CAPval, peakPAg, peakPC, peakCP, peakCAP, clReachable }) {
@@ -1460,6 +1560,22 @@ export default function CompetitiveLFASimulator() {
   });
   const [kineticParams, setKineticParams] = useState(defaultKinetic());
   const [physParams,    setPhysParams]    = useState(defaultPhysical());
+
+  // ── Slider upper-limit overrides ───────────────────────────────────────────
+  // The user can extend the upper bound of any concentration slider via the
+  // "Limits" sub-tab. State here lives only for the session — no persistence.
+  const [sliderLimits, setSliderLimits] = useState(defaultSliderLimits());
+
+  // Updater that:
+  //   1. writes the new max into sliderLimits, and
+  //   2. clamps the corresponding userParams value down if it now exceeds max.
+  // Without step 2 the slider thumb would render off-screen.
+  const updateSliderLimit = useCallback((key, newMax) => {
+    setSliderLimits(prev => ({ ...prev, [key]: newMax }));
+    setUserParams(prev =>
+      prev[key] > newMax ? { ...prev, [key]: newMax } : prev);
+  }, []);
+
   const [simData,   setSimData]   = useState(null);
   const [running,   setRunning]   = useState(false);
   const [frameIdx,  setFrameIdx]  = useState(0);
@@ -1619,7 +1735,7 @@ export default function CompetitiveLFASimulator() {
           display:"flex",flexDirection:"column",gap:0,maxHeight:"calc(100vh - 80px)",overflowY:"auto"}}>
 
           <div style={{display:"flex",gap:4,marginBottom:14,background:T.surface,borderRadius:7,padding:3}}>
-            {[["assay","Assay"],["kinetic","Kinetics"],["physical","Physical"]].map(([id,lbl])=>(
+            {[["assay","Assay"],["kinetic","Kinetics"],["physical","Physical"],["limits","Limits"]].map(([id,lbl])=>(
               <button key={id} onClick={()=>setParamTab(id)}
                 style={{flex:1,background:paramTab===id?"#1a2a20":T.surface,
                   border:`1px solid ${paramTab===id?T.borderHi:"transparent"}`,
@@ -1638,9 +1754,9 @@ export default function CompetitiveLFASimulator() {
             <LogSlider label="Analyte [A₀]" value={userParams.Ao}
               logMin={-2} logMax={3} unit="nM" color={T.A}
               onChange={set_up("Ao")}/>
-            <Slider label="Detector [P₀]"          value={userParams.Po}     min={0.1} max={100} step={0.5}   unit="nM" color={T.P}   onChange={set_up("Po")}/>
-            <Slider label="Immob. antigen [Ag_TL]" value={userParams.Ag_tl}  min={0.1} max={100} step={0.5}   unit="nM" color={T.PAg} onChange={set_up("Ag_tl")}/>
-            <Slider label="Ctrl receptor [Rc]"      value={userParams.Ro_cl} min={0.1} max={100} step={0.5}   unit="nM" color={T.PC}  onChange={set_up("Ro_cl")}/>
+            <Slider label="Detector [P₀]"          value={userParams.Po}     min={0.1} max={sliderLimits.Po}    step={0.5}   unit="nM" color={T.P}   onChange={set_up("Po")}/>
+            <Slider label="Immob. antigen [Ag_TL]" value={userParams.Ag_tl}  min={0.1} max={sliderLimits.Ag_tl} step={0.5}   unit="nM" color={T.PAg} onChange={set_up("Ag_tl")}/>
+            <Slider label="Ctrl receptor [Rc]"      value={userParams.Ro_cl} min={0.1} max={sliderLimits.Ro_cl} step={0.5}   unit="nM" color={T.PC}  onChange={set_up("Ro_cl")}/>
             <Slider label="Test line x"             value={userParams.x_tl}  min={10}  max={50}  step={5}     unit="mm" color={T.PAg} onChange={set_up("x_tl")}/>
             <Slider label="Control line x"          value={userParams.x_cl}
               min={Math.min(userParams.x_tl+10, physParams.strip_L-5)}
@@ -1696,6 +1812,39 @@ export default function CompetitiveLFASimulator() {
                 color:T.muted2,padding:"5px 0",borderRadius:6,cursor:"pointer",
                 fontFamily:"inherit",fontSize:10,width:"100%"}}>
               Reset to Defaults
+            </button>
+          </>}
+
+          {/* Limits params (extend slider upper bounds) */}
+          {paramTab==="limits" && <>
+            <div style={{fontSize:9,color:T.muted,letterSpacing:3,textTransform:"uppercase",marginBottom:4}}>Slider Upper Limits</div>
+            <div style={{fontSize:9,color:T.muted2,marginBottom:12,lineHeight:1.5}}>
+              Extend the upper bound of any concentration slider. Enter a positive
+              number above the slider's floor, then press Enter or click away.
+              If the current slider value is above your new max, it will be clamped down.
+            </div>
+            {SLIDER_LIMITS_META.map(m=>(
+              <LimitRow key={m.key} meta={m}
+                currentValue={userParams[m.key]}
+                currentMax={sliderLimits[m.key]}
+                onChange={v=>updateSliderLimit(m.key,v)}/>
+            ))}
+            <button onClick={()=>{
+                // Reset all limits to defaults; then clamp any params that
+                // would now sit above the restored defaults.
+                const def = defaultSliderLimits();
+                setSliderLimits(def);
+                setUserParams(p => {
+                  const next = {...p};
+                  for (const k of Object.keys(def))
+                    if (next[k] > def[k]) next[k] = def[k];
+                  return next;
+                });
+              }}
+              style={{marginTop:8,background:T.surface,border:`1px solid ${T.border}`,
+                color:T.muted2,padding:"5px 0",borderRadius:6,cursor:"pointer",
+                fontFamily:"inherit",fontSize:10,width:"100%"}}>
+              Reset Limits to Defaults
             </button>
           </>}
 
